@@ -1,17 +1,138 @@
 "use client";
 
-import {
-  GoogleMap,
-  useLoadScript,
-  MarkerF,
-  Autocomplete,
-} from "@react-google-maps/api";
-import { useState, useRef, useEffect } from "react";
+import { GoogleMap, useLoadScript } from "@react-google-maps/api";
+import { useState, useRef, useEffect, useCallback } from "react";
 
-const containerStyle = {
-  width: "100%",
-  height: "100vh",
-};
+// --- [전역 타입 선언] ---
+declare global {
+  namespace JSX {
+    interface IntrinsicElements {
+      "gmp-place-autocomplete": any;
+    }
+  }
+}
+
+// --- [API 설정] ---
+const LIBRARIES = ["places", "marker"] as const;
+const GOOGLE_MAPS_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY!;
+
+/* =========================================================
+   🔥 장소 데이터 변환 함수
+========================================================= */
+async function transformPlace(place: any) {
+  if (!place) return null;
+
+  const { Place } = (await google.maps.importLibrary("places")) as google.maps.PlacesLibrary;
+
+  let modernPlace = place;
+  const pid = modernPlace.id || modernPlace.place_id || modernPlace.placePrediction?.placeId;
+
+  if (pid && !(modernPlace instanceof Place)) {
+    modernPlace = new Place({ id: pid });
+  }
+
+  // 1. 필요한 필드 요청
+  await modernPlace.fetchFields({
+    fields: [
+      "displayName",
+      "formattedAddress",
+      "location",
+      "rating",
+      "userRatingCount",
+      "regularOpeningHours",
+      "photos",
+      "internationalPhoneNumber",
+      "websiteURI",
+      "googleMapsURI",
+      "id",
+      "types",
+      "utcOffsetMinutes",
+    ],
+  });
+
+  // 2. 영업 상태 확인 로직
+  let openStatus = false;
+  try {
+    openStatus = await modernPlace.isOpen();
+  } catch (e) {
+    openStatus = false; 
+  }
+
+  // 3. 텍스트 정보 추출
+  const weekdayText = modernPlace.regularOpeningHours?.weekdayDescriptions || [];
+
+  // 사진 URL 추출
+  const firstPhoto = modernPlace.photos?.[0];
+  const photoString = firstPhoto?.getURI
+    ? firstPhoto.getURI({ maxWidth: 400, maxHeight: 400 })
+    : null;
+
+  return {
+    place_id: modernPlace.id,
+    name: modernPlace.displayName || "장소 정보",
+    formatted_address: modernPlace.formattedAddress || "주소 정보 없음",
+    geometry: { location: modernPlace.location },
+    rating: modernPlace.rating,
+    user_ratings_total: modernPlace.userRatingCount,
+    opening_hours: {
+      isOpen: openStatus,
+      weekdayText: weekdayText,
+    },
+    photoUrl: photoString,
+    formatted_phone_number: modernPlace.internationalPhoneNumber,
+    types: modernPlace.types,
+    websiteURI: modernPlace.websiteURI,
+  };
+}
+
+/* =========================================================
+   📍 Advanced Marker 컴포넌트
+========================================================= */
+function AdvancedMarker({
+  map,
+  position,
+  onClick,
+}: {
+  map: google.maps.Map | null;
+  position: google.maps.LatLngLiteral;
+  onClick?: () => void;
+}) {
+  const markerRef = useRef<any>(null);
+
+  useEffect(() => {
+    if (!map) return;
+
+    const init = async () => {
+      const { AdvancedMarkerElement } = (await google.maps.importLibrary("marker")) as google.maps.MarkerLibrary;
+
+      if (!markerRef.current) {
+        markerRef.current = new AdvancedMarkerElement({
+          map,
+          position,
+        });
+
+        if (onClick) {
+          markerRef.current.addListener("click", onClick);
+        }
+      } else {
+        markerRef.current.position = position;
+      }
+    };
+
+    init();
+
+    return () => {
+      if (markerRef.current) {
+        markerRef.current.map = null;
+        markerRef.current = null;
+      }
+    };
+  }, [map, position, onClick]);
+
+  return null;
+}
+
+const containerStyle = { width: "100%", height: "100vh" };
 
 type SavedMarker = {
   id: string;
@@ -19,517 +140,402 @@ type SavedMarker = {
   lng: number;
   name: string;
   address?: string;
+  types?: string[];
 };
 
+/* =========================================================
+   🚀 메인 컴포넌트
+========================================================= */
 export default function Home() {
-  // ===========================
-  // ✅ Google Maps 로드
-  // ===========================
   const { isLoaded } = useLoadScript({
-    googleMapsApiKey: process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY!,
-    libraries: ["places"],
+    googleMapsApiKey: GOOGLE_MAPS_API_KEY,
+    libraries: LIBRARIES as any,
   });
 
-  // ===========================
-  // 📌 상태
-  // ===========================
-  const [center, setCenter] = useState({
-    lat: 37.5665,
-    lng: 126.978,
-  });
+  const [map, setMap] = useState<google.maps.Map | null>(null);
+  const [center, setCenter] = useState({ lat: 37.5665, lng: 126.978 });
+  
+  // 데이터 상태와 UI 표시 상태 분리
+  const [selectedPlace, setSelectedPlace] = useState<any>(null); // 장소 데이터
+  const [showDetails, setShowDetails] = useState(false);         // 카드 표시 여부
 
-  const [myLocation, setMyLocation] =
-    useState<google.maps.LatLngLiteral | null>(null);
-
-  const [selectedPlace, setSelectedPlace] =
-    useState<google.maps.places.PlaceResult | null>(null);
-
-  const [savedMarkers, setSavedMarkers] =
-    useState<SavedMarker[]>([]);
-
-  const [isCardVisible, setIsCardVisible] =
-    useState(false);
-
-  const autocompleteRef =
-    useRef<google.maps.places.Autocomplete | null>(null);
-
+  const [savedMarkers, setSavedMarkers] = useState<SavedMarker[]>([]);
   const mapRef = useRef<google.maps.Map | null>(null);
 
-  const autoCloseTimer =
-    useRef<NodeJS.Timeout | null>(null);
+  // 🏪 카테고리 아이콘 반환 함수
+  const getCategoryIcon = (types?: string[]) => {
+    if (!types || types.length === 0) return "📍";
+    if (types.includes("restaurant") || types.includes("food")) return "🍽️";
+    if (types.includes("cafe") || types.includes("bakery")) return "☕";
+    if (types.includes("bar") || types.includes("night_club")) return "🍺";
+    if (types.includes("lodging") || types.includes("hotel")) return "🏨";
+    if (types.includes("tourist_attraction") || types.includes("museum")) return "📸";
+    if (types.includes("shopping_mall") || types.includes("store")) return "🛍️";
+    if (types.includes("park")) return "🌳";
+    if (types.includes("gym") || types.includes("health")) return "💪";
+    if (types.includes("hospital")) return "🏥";
+    if (types.includes("school") || types.includes("university")) return "🎓";
+    return "📍";
+  };
 
-  // ===========================
-  // 📍 현재 위치 가져오기
-  // ===========================
+  // 🕒 오늘의 영업시간 텍스트 추출 함수
+  const getTodayHours = (weekdayText: string[]) => {
+    if (!weekdayText || weekdayText.length === 0) return "";
+    const todayIndex = new Date().getDay(); 
+    const googleIndex = todayIndex === 0 ? 6 : todayIndex - 1;
+    const rawText = weekdayText[googleIndex];
+    if (!rawText) return "";
+    return rawText.split(": ").slice(1).join(": ") || rawText;
+  };
+
+  // 📋 전화번호 복사 함수
+  const handleCopyPhone = (phone: string) => {
+    navigator.clipboard.writeText(phone);
+    alert(`전화번호가 복사되었습니다: ${phone}`);
+  };
+
   useEffect(() => {
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition((pos) => {
-        const location = {
+        setCenter({
           lat: pos.coords.latitude,
           lng: pos.coords.longitude,
-        };
-        setCenter(location);
-        setMyLocation(location);
+        });
       });
+    }
+
+    const saved = localStorage.getItem("my_saved_places");
+    if (saved) {
+      setSavedMarkers(JSON.parse(saved));
     }
   }, []);
 
-  // ===========================
-  // 📌 카드 자동 닫힘 (5초)
-  // ===========================
+  // 🔎 검색 이벤트 핸들러
   useEffect(() => {
-    if (selectedPlace) {
-      setIsCardVisible(true);
+    if (!isLoaded) return;
+    const initAutocomplete = async () => {
+      const placesLib = (await google.maps.importLibrary("places")) as any;
+      const PlaceAutocompleteElement = placesLib.PlaceAutocompleteElement;
+      
+      if (document.querySelector("gmp-place-autocomplete")) return;
+      
+      const autocomplete = new PlaceAutocompleteElement();
+      autocomplete.placeholder = "장소를 검색해보세요";
+      const container = document.getElementById("autocomplete-container");
+      
+      if (container) {
+        container.innerHTML = "";
+        container.appendChild(autocomplete);
+        
+        autocomplete.addEventListener("gmp-select", async (e: any) => {
+          const prediction = e.placePrediction;
+          if (!prediction) return;
 
-      /*
-      autoCloseTimer.current = setTimeout(() => {
-        closeCard();
-      }, 5000);
-      */
-    }
+          const place = prediction.toPlace();
+          const formatted = await transformPlace(place);
 
-    return () => {
-      if (autoCloseTimer.current)
-        clearTimeout(autoCloseTimer.current);
-    };
-  }, [selectedPlace]);
+          if (formatted && formatted.geometry?.location) {
+            const loc = formatted.geometry.location;
+            const lat = typeof loc.lat === 'function' ? loc.lat() : loc.lat;
+            const lng = typeof loc.lng === 'function' ? loc.lng() : loc.lng;
 
-  const closeCard = () => {
-    setIsCardVisible(false);
+            setCenter({ lat, lng });
+            mapRef.current?.panTo({ lat, lng });
+            mapRef.current?.setZoom(16);
 
-    setTimeout(() => {
-      setSelectedPlace(null);
-    }, 300);
-  };
-
-  // ===========================
-  // 🔎 검색 선택
-  // ===========================
-  const onPlaceChanged = () => {
-    if (!autocompleteRef.current) return;
-
-    const place = autocompleteRef.current.getPlace();
-    if (!place.geometry?.location) return;
-
-    setCenter({
-      lat: place.geometry.location.lat(),
-      lng: place.geometry.location.lng(),
-    });
-
-    setSelectedPlace(place);
-  };
-
-  // ===========================
-  // 📌 지도 클릭 (구글 기본 팝업 차단)
-  // ===========================
-  const handleMapClick = (
-    e: google.maps.MapMouseEvent
-  ) => {
-    if (!mapRef.current) return;
-
-    if ((e as any).placeId) {
-      e.stop(); // 🔥 기본 InfoWindow 차단
-
-      const service =
-        new google.maps.places.PlacesService(
-          mapRef.current
-        );
-
-      service.getDetails(
-        {
-          placeId: (e as any).placeId,
-          fields: [
-            "name",
-            "formatted_address",
-            "rating",
-            "user_ratings_total",
-            "price_level",
-            "opening_hours",
-            "photos",
-            "formatted_phone_number",
-            "website",
-            "url",
-            "place_id",
-            "geometry",
-            "icon",
-            "icon_background_color",
-          ],
-        },
-        (place, status) => {
-          if (
-            status ===
-            google.maps.places
-              .PlacesServiceStatus.OK &&
-            place
-          ) {
-            setSelectedPlace(place);
+            // [변경점] 마커는 표시하되(selectedPlace 저장), 카드는 숨김(showDetails false)
+            setSelectedPlace(formatted);
+            setShowDetails(false); 
           }
-        }
-      );
-    } else {
-      closeCard();
-    }
-  };
-
-  // ===========================
-  // 📌 마커 클릭 (상세 정보 로드)
-  // ===========================
-  const handleMarkerClick = (marker: SavedMarker) => {
-    if (!mapRef.current) return;
-
-    const service = new google.maps.places.PlacesService(mapRef.current);
-    service.getDetails(
-      {
-        placeId: marker.id,
-        fields: [
-          "name",
-          "formatted_address",
-          "rating",
-          "user_ratings_total",
-          "price_level",
-          "opening_hours",
-          "photos",
-          "formatted_phone_number",
-          "website",
-          "url",
-          "place_id",
-          "geometry",
-        ],
-      },
-      (place, status) => {
-        if (status === google.maps.places.PlacesServiceStatus.OK && place) {
-          setSelectedPlace(place);
-        }
+        });
       }
-    );
-  };
+    };
+    initAutocomplete();
+  }, [isLoaded]);
 
-  // ===========================
-  // 📌 저장
-  // ===========================
+  // 🗺 지도 클릭 (빈 곳 클릭 시 초기화)
+  const handleMapClick = useCallback(async (e: google.maps.MapMouseEvent) => {
+    if (!mapRef.current) return;
+    
+    // POI(지도상 아이콘) 클릭 시 처리
+    if ((e as any).placeId) {
+      e.stop();
+      const { Place } = (await google.maps.importLibrary("places")) as google.maps.PlacesLibrary;
+      const place = new Place({ id: (e as any).placeId });
+      const formatted = await transformPlace(place);
+      
+      setSelectedPlace(formatted);
+      setShowDetails(true); // 직접 클릭했으니 정보 보여주기
+    } else {
+      // 빈 곳 클릭 시 선택 해제
+      setSelectedPlace(null);
+      setShowDetails(false);
+    }
+  }, []);
+
   const handleSavePlace = () => {
     if (!selectedPlace?.geometry?.location) return;
-
+    const loc = selectedPlace.geometry.location;
     const newMarker: SavedMarker = {
-      id: selectedPlace.place_id!,
-      lat: selectedPlace.geometry.location.lat(),
-      lng: selectedPlace.geometry.location.lng(),
-      name: selectedPlace.name || "",
+      id: selectedPlace.place_id,
+      lat: typeof loc.lat === 'function' ? loc.lat() : loc.lat,
+      lng: typeof loc.lng === 'function' ? loc.lng() : loc.lng,
+      name: selectedPlace.name,
       address: selectedPlace.formatted_address,
+      types: selectedPlace.types,
     };
-
-    setSavedMarkers((prev) => [...prev, newMarker]);
+    const updated = [...savedMarkers, newMarker];
+    setSavedMarkers(updated);
+    localStorage.setItem("my_saved_places", JSON.stringify(updated));
   };
 
-  // ===========================
-  // 📌 삭제
-  // ===========================
   const handleDeletePlace = () => {
-    if (!selectedPlace?.place_id) return;
-
-    setSavedMarkers((prev) =>
-      prev.filter((m) => m.id !== selectedPlace.place_id)
-    );
-    closeCard();
+    const updated = savedMarkers.filter((m) => m.id !== selectedPlace.place_id);
+    setSavedMarkers(updated);
+    localStorage.setItem("my_saved_places", JSON.stringify(updated));
+    setSelectedPlace(null);
+    setShowDetails(false);
   };
 
-  if (!isLoaded) return <div>Loading...</div>;
+  if (!isLoaded) return <div style={{ padding: 20 }}>Loading...</div>;
 
   return (
-    <div style={{ position: "relative" }}>
-      {/* ===========================
-          🔎 검색창
-      =========================== */}
+    <div style={{ position: "relative", width: "100vw", height: "100vh", overflow: "hidden" }}>
+      {/* 🔎 검색창 */}
       <div
         style={{
           position: "absolute",
-          top: "20px",
+          top: 20,
           left: "50%",
           transform: "translateX(-50%)",
           zIndex: 10,
           width: "90%",
-          maxWidth: "400px",
+          maxWidth: 400,
         }}
       >
-        <Autocomplete
-          onLoad={(ref) =>
-            (autocompleteRef.current = ref)
-          }
-          onPlaceChanged={onPlaceChanged}
-          options={{
-            fields: [
-              "name",
-              "formatted_address",
-              "geometry",
-            ],
-          }}
-        >
-          <input
-            type="text"
-            placeholder="장소 검색..."
-            style={{
-              width: "100%",
-              padding: "12px",
-              borderRadius: "12px",
-              border: "1px solid #ddd",
-              background: "#fff",
-              color: "#000",
-            }}
-          />
-        </Autocomplete>
+        <div id="autocomplete-container" />
       </div>
 
-      {/* ===========================
-          🗺 지도
-      =========================== */}
+      {/* 🗺 지도 */}
       <GoogleMap
         mapContainerStyle={containerStyle}
         center={center}
-        zoom={15}
-        onLoad={(map) => {
-          mapRef.current = map;
+        zoom={14}
+        onLoad={(m) => {
+          mapRef.current = m;
+          setMap(m);
         }}
         onClick={handleMapClick}
         options={{
+          mapId: "AIzaSyCIvFUn_6kp7fbK0umBs_lA9hG0TWhKYuk",
           clickableIcons: true,
+          disableDefaultUI: false,
+          zoomControl: true,
         }}
       >
-        {myLocation && (
-        <MarkerF
-          position={myLocation}
-          icon={{
-            path: google.maps.SymbolPath.CIRCLE,
-            scale: 8,
-            fillColor: "#4285F4",
-            fillOpacity: 1,
-            strokeColor: "#ffffff",
-            strokeWeight: 3,
-          }}
-          zIndex={999} // 다른 마커보다 위에 표시
-        />
-      )}
-
-        {savedMarkers.map((marker) => (
-          <MarkerF
-            key={marker.id}
+        {/* 현재 선택된(검색된) 장소 마커 */}
+        {selectedPlace?.geometry?.location && (
+          <AdvancedMarker
+            map={map}
             position={{
-              lat: marker.lat,
-              lng: marker.lng,
+              lat: typeof selectedPlace.geometry.location.lat === 'function' 
+                ? selectedPlace.geometry.location.lat() 
+                : selectedPlace.geometry.location.lat,
+              lng: typeof selectedPlace.geometry.location.lng === 'function' 
+                ? selectedPlace.geometry.location.lng() 
+                : selectedPlace.geometry.location.lng,
             }}
-            onClick={() => handleMarkerClick(marker)}
+            // [중요] 마커 클릭 시 카드를 표시하도록 설정
+            onClick={() => setShowDetails(true)}
+          />
+        )}
+
+        {/* 저장된 장소 마커들 */}
+        {savedMarkers.map((marker) => (
+          <AdvancedMarker
+            key={marker.id}
+            map={map}
+            position={{ lat: marker.lat, lng: marker.lng }}
+            onClick={() => {
+              setCenter({ lat: marker.lat, lng: marker.lng });
+              // 저장된 마커 클릭 시에는 바로 정보를 보여줄지, 이동만 할지 결정
+              // 여기서는 일단 이동만 하도록 둠 (원하면 로직 추가 가능)
+            }}
           />
         ))}
       </GoogleMap>
 
-      {/* ===========================
-          📌 하단 고정 카드
-      =========================== */}
-      {selectedPlace && (
+      {/* 📌 정보 카드 (showDetails가 true일 때만 표시) */}
+      {selectedPlace && showDetails && (
         <div
           style={{
             position: "absolute",
-            bottom: "20px",
+            bottom: "30px",
             left: "50%",
-            transform: isCardVisible
-              ? "translate(-50%,0)"
-              : "translate(-50%,40px)",
-            opacity: isCardVisible ? 1 : 0,
-            transition: "all 0.3s ease",
-            width: "92%",
-            maxWidth: "420px",
-            background: "#fff",
-            color: "#222",
+            transform: "translateX(-50%)",
+            width: "90%",
+            maxWidth: "400px",
+            padding: "24px 20px",
             borderRadius: "16px",
-            padding: "16px",
-            boxShadow:
-              "0 12px 30px rgba(0,0,0,0.25)",
-            zIndex: 100,
+            background: "white",
+            boxShadow: "0 4px 20px rgba(0,0,0,0.15)",
+            zIndex: 20,
+            animation: "fadeIn 0.3s ease-out",
+            fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
           }}
         >
-          <div
+          <button
+            onClick={() => setShowDetails(false)}
             style={{
-              textAlign: "right",
+              position: "absolute",
+              top: 15,
+              right: 15,
+              border: "none",
+              background: "transparent",
+              fontSize: "20px",
+              color: "#999",
               cursor: "pointer",
-              marginBottom: "8px",
             }}
-            onClick={closeCard}
           >
             ✕
+          </button>
+
+          {/* 🖼 이미지 */}
+          {selectedPlace.photoUrl && (
+            <img
+              src={selectedPlace.photoUrl}
+              alt="place"
+              style={{
+                width: "100%",
+                height: "160px",
+                objectFit: "cover",
+                borderRadius: "12px",
+                marginBottom: "16px",
+              }}
+            />
+          )}
+
+          {/* 🏷 타이틀 */}
+          <h3 style={{ margin: "0 0 4px 0", fontSize: "19px", color: "#242424", fontWeight: 700, lineHeight: 1.4 }}>
+            {getCategoryIcon(selectedPlace.types)} {selectedPlace.name}
+          </h3>
+          
+          {/* ⭐ 별점 */}
+          {selectedPlace.rating && (
+            <div style={{ fontSize: "14px", color: "#555", marginBottom: "12px" }}>
+              <span style={{ color: "#f5a623" }}>★</span> 
+              <span style={{ fontWeight: 600 }}>{selectedPlace.rating}</span>
+              <span style={{ color: "#999" }}> ({selectedPlace.user_ratings_total}명)</span>
+            </div>
+          )}
+
+          <hr style={{ border: "none", borderTop: "1px solid #eee", margin: "12px 0" }} />
+
+          {/* 📍 주소 */}
+          <div style={{ display: "flex", alignItems: "flex-start", marginBottom: "12px", fontSize: "14px", lineHeight: 1.5 }}>
+            <span style={{ marginRight: "10px", color: "#70757a", marginTop: "2px" }}>📍</span>
+            <span style={{ color: "#3c4043" }}>{selectedPlace.formatted_address}</span>
           </div>
 
-          {/* 썸네일 + 이름 */}
-          <div
-            style={{
-              display: "flex",
-              gap: "12px",
-              alignItems: "center",
-            }}
-          >
-            {selectedPlace.photos?.[0] && (
-              <img
-                src={selectedPlace.photos[0].getUrl()}
-                style={{
-                  width: "80px",
-                  height: "80px",
-                  objectFit: "cover",
-                  borderRadius: "12px",
-                }}
-              />
-            )}
-
+          {/* 🕒 영업시간 */}
+          <div style={{ display: "flex", alignItems: "flex-start", marginBottom: "12px", fontSize: "14px", lineHeight: 1.5 }}>
+            <span style={{ marginRight: "10px", color: "#70757a", marginTop: "2px" }}>🕒</span>
             <div>
-              <h3
-  style={{
-    margin: 0,
-    display: "flex",
-    alignItems: "center",
-    gap: "8px",
-  }}
->
-  {selectedPlace.icon && (
-    <img
-      src={selectedPlace.icon}
-      alt="category"
-      style={{
-        width: "20px",
-        height: "20px",
-        backgroundColor:
-          selectedPlace.icon_background_color || "transparent",
-        borderRadius: "4px",
-        padding: "2px",
-      }}
-    />
-  )}
-
-  <span>{selectedPlace.name}</span>
-
-  {selectedPlace.rating && (
-    <span
-      style={{
-        fontSize: "14px",
-        marginLeft: "6px",
-        color: "#f5a623",
-      }}
-    >
-      ⭐ {selectedPlace.rating}
-    </span>
-  )}
-</h3>
-             
-  {(selectedPlace.opening_hours || selectedPlace.formatted_phone_number) && (
-  <div
-    style={{
-      display: "flex",
-      gap: "12px",
-      alignItems: "center",
-      fontSize: "14px",
-      marginTop: "6px",
-    }}
-  >
-    {/* 🕒 영업 여부 */}
-    {selectedPlace.opening_hours && (
-      <span
-        style={{
-          color: selectedPlace.opening_hours.isOpen()
-            ? "#2e7d32" // 🟢 영업중 (초록)
-            : "#9e9e9e", // 🔴 영업종료 (회색)
-          fontWeight: 500,
-        }}
-      >
-        {selectedPlace.opening_hours.isOpen()
-          ? "🟢 영업중"
-          : "🔴 영업종료"}
-      </span>
-    )}
-
-    {/* 📞 전화번호 (클릭 시 바로 전화) */}
-    {selectedPlace.formatted_phone_number && (
-      <a
-        href={`tel:${selectedPlace.formatted_phone_number.replace(
-          /[^0-9+]/g,
-          ""
-        )}`}
-        style={{
-          color: "#1976d2",
-          textDecoration: "none",
-          fontWeight: 500,
-        }}
-      >
-        📞 {selectedPlace.formatted_phone_number}
-      </a>
-    )}
-  </div>
-)}
-         <p
+              <span
                 style={{
-                  fontSize: "13px",
-                  color: "#666",
+                  fontWeight: "bold",
+                  color: selectedPlace.opening_hours.isOpen ? "#188038" : "#d93025",
+                  marginRight: "6px"
                 }}
               >
-                {selectedPlace.formatted_address}
-              </p>              
+                {selectedPlace.opening_hours.isOpen ? "영업 중" : "영업 종료"}
+              </span>
+              <span style={{ color: "#70757a" }}>
+                 · {getTodayHours(selectedPlace.opening_hours.weekdayText)}
+              </span>
             </div>
-          </div>   
+          </div>
 
-        
-{/*
-          {selectedPlace.website && (
-            <p>
-              <a
-                href={selectedPlace.website}
-                target="_blank"
+          {/* 📞 전화번호 & 복사 */}
+          {selectedPlace.formatted_phone_number && (
+            <div style={{ display: "flex", alignItems: "center", marginBottom: "12px", fontSize: "14px", lineHeight: 1.5 }}>
+              <span style={{ marginRight: "10px", color: "#70757a" }}>📞</span>
+              <span style={{ color: "#3c4043", marginRight: "8px" }}>{selectedPlace.formatted_phone_number}</span>
+              <button
+                onClick={() => handleCopyPhone(selectedPlace.formatted_phone_number)}
+                style={{
+                  border: "1px solid #dadce0",
+                  background: "white",
+                  color: "#1a73e8",
+                  borderRadius: "100px",
+                  fontSize: "12px",
+                  padding: "2px 10px",
+                  cursor: "pointer",
+                  fontWeight: 500
+                }}
               >
-                🌐 홈페이지
-              </a>
-            </p>
-          )}
-*/}
-          {selectedPlace.url && (
-            <p>
-              <a
-                href={selectedPlace.url}
-                target="_blank"
-              >
-                🗺 지도에서 보기
-              </a>
-            </p>
+                복사
+              </button>
+            </div>
           )}
 
-          {savedMarkers.some((m) => m.id === selectedPlace.place_id) ? (
-            <button
-              onClick={handleDeletePlace}
-              style={{
-                marginTop: "10px",
-                padding: "10px",
-                borderRadius: "8px",
-                border: "none",
-                background: "#d32f2f",
-                color: "#fff",
-                cursor: "pointer",
-                width: "100%",
-              }}
-            >
-              🗑 PinDiary 삭제
-            </button>
-          ) : (
-            <button
-              onClick={handleSavePlace}
-              style={{
-                marginTop: "10px",
-                padding: "10px",
-                borderRadius: "8px",
-                border: "none",
-                background: "#1976d2",
-                color: "#fff",
-                cursor: "pointer",
-                width: "100%",
-              }}
-            >
-              📌 PinDiary 저장
-            </button>
-          )}
+          {/* 🔗 웹사이트 */}
+           {selectedPlace.websiteURI && (
+             <div style={{ display: "flex", alignItems: "center", marginBottom: "12px", fontSize: "14px" }}>
+               <span style={{ marginRight: "10px", color: "#70757a" }}>🌐</span>
+               <a href={selectedPlace.websiteURI} target="_blank" rel="noreferrer" style={{ color: "#1a73e8", textDecoration: "none" }}>
+                 웹사이트 방문
+               </a>
+             </div>
+           )}
+
+          <div style={{ marginTop: "20px" }}>
+            {savedMarkers.some((m) => m.id === selectedPlace.place_id) ? (
+              <button
+                onClick={handleDeletePlace}
+                style={{
+                  width: "100%",
+                  padding: "12px",
+                  backgroundColor: "#f2f2f2",
+                  color: "#d93025",
+                  border: "none",
+                  borderRadius: "8px",
+                  fontWeight: "bold",
+                  fontSize: "14px",
+                  cursor: "pointer",
+                }}
+              >
+                삭제하기
+              </button>
+            ) : (
+              <button
+                onClick={handleSavePlace}
+                style={{
+                  width: "100%",
+                  padding: "12px",
+                  backgroundColor: "#1a73e8",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "8px",
+                  fontWeight: "bold",
+                  fontSize: "14px",
+                  cursor: "pointer",
+                  boxShadow: "0 1px 2px rgba(60,64,67,0.3), 0 1px 3px 1px rgba(60,64,67,0.15)"
+                }}
+              >
+                저장하기
+              </button>
+            )}
+          </div>
         </div>
       )}
+
+      <style jsx global>{`
+        @keyframes fadeIn {
+          from { opacity: 0; transform: translate(-50%, 20px); }
+          to { opacity: 1; transform: translate(-50%, 0); }
+        }
+      `}</style>
     </div>
   );
 }
